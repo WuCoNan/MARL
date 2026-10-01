@@ -61,7 +61,9 @@ MARL/
 | PyTorch Geometric | 2.8.0 | `GATConv` 等 |
 | 其它 | gymnasium / networkx / tensorboard | 见 `requirements.txt` |
 
-Python 虚拟环境位于 **`~/marl_env`**（仓库内的 `.venv/` 已被 git 忽略）。
+Python 虚拟环境统一使用 **`~/marl_env`**（Python 3.14 + GPU 版 torch + PyG + ns3-ai 可编辑安装）。
+仓库内不再保留第二份 `.venv/`，避免出现 CPU 版 torch 等与 `~/marl_env` 冲突的重复依赖；
+`.gitignore` 已忽略 `.venv/`、`venv/`、`.env/`。如需重建临时环境，直接用 `python3 -m venv .venv` 并安装 `requirements.txt` 即可。
 
 ```bash
 source ~/marl_env/bin/activate
