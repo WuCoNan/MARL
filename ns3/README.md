@@ -49,26 +49,61 @@ NS3_ROOT=/path/to/ns-3.40 bash scripts/sync_ns3.sh --apply
 
 ## 编译与运行
 
-前置条件见仓库根目录 [README.md](../README.md)。核心命令：
+前置条件见仓库根目录 [README.md](../README.md)。
 
 ```bash
 cd $NS3_ROOT
 
-# 1) 配置（首次或改了 CMakeLists 之后）
-./ns3 configure --enable-examples --enable-tests
+# 1) 配置 —— 必须用 cmake 直接配置
+#    ns-3.40 自带的 ./ns3 configure 在 Python 3.14 下静默失效（argparse 不兼容），
+#    且选项名是 NS3_TESTS / NS3_EXAMPLES，不是 --enable-tests。
+cd build
+cmake -DNS3_TESTS=ON -DNS3_EXAMPLES=ON ..
+cd ..
 
-# 2) 编译
+# 2) 编译（首次约 8 分钟，增量很快）
 ./ns3 build
 
-# 3) 多路径 + GNN 观测单测（18 项断言）
+# 3) ns-3 官方测试驱动：原版 DSDV 回归
+./test.py -s routing-dsdv          # 期望：PASS routing-dsdv
+
+# 4) 多路径 + GNN 观测验证（18 项断言）
 ./build/scratch/ns3.40-test-mp-dsdv-gnn-default
 
-# 4) ns3-ai 联合仿真（C++ 端 + Python 端）
+# 5) ns3-ai 联合仿真（C++ 端 + Python 端）
 python3 contrib/ai/examples/dsdv-gnn-marl/dsdv_gnn_marl.py
 ```
 
 > Python 端需要 torch / torch-geometric，并使用与 pybind11 模块匹配的解释器版本
 > （当前 `.so` 为 `cpython-314`，即 Python 3.14）。
+
+## ⚠️ 已知陷阱：必须开启 NS3_TESTS
+
+**症状**：`./build/utils/ns3.40-test-runner-default --suite=routing-dsdv` 崩溃，报
+
+```
+NS_ASSERT failed, cond="g_markingTimes->count(time) == 1",
+msg="Time object ... registered 0 times (should be 1)"
+```
+
+**原因**：这**不是**协议代码的缺陷，而是**陈旧构建产物导致的 ABI 不匹配**。
+当配置中未开启测试时，ns-3 不会重建 `libns3-*-test.so` 与 `test-runner`；
+而 `src/dsdv` 的头文件已经改过（`RoutingTable` 增加了 `m_multipathEntries` 成员，
+类布局变化），于是测试目标仍按旧布局分配对象、共享库却按新布局初始化，
+析构时按旧偏移访问到 `std::map` 内部数据并当作 `Time` 解析，触发断言。
+
+**处理**：按上文第 1 步开启 `-DNS3_TESTS=ON` 并完整重建一次即可。
+
+**排查依据**（2026-10-01 实测）：
+
+| 条件 | 结果 |
+|---|---|
+| 未开启测试（沿用 7 月的陈旧 test-runner） | CRASH |
+| 换回 ns-3.40 原版 DSDV 源码 | PASS（说明崩溃随源码而变，指向构建一致性） |
+| 仅把 `dsdv-rtable.{h,cc}` 换回原版 | CRASH（相同 ABI 不匹配） |
+| 开启 `NS3_TESTS` 并完整重建后运行项目版 | **PASS** |
+
+结论：项目对 DSDV 的改动**没有破坏**上游 DSDV 行为。
 
 ## 关键设计速览
 

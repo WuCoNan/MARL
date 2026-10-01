@@ -87,12 +87,21 @@ export NS3_ROOT=~/ns-allinone-3.40/ns-3.40
 bash scripts/sync_ns3.sh --apply
 
 cd $NS3_ROOT
-./ns3 configure --enable-examples --enable-tests
+
+# ⚠️ 必须用 cmake 直接配置：ns-3.40 的 ./ns3 configure 在 Python 3.14 下静默失效
+cd build && cmake -DNS3_TESTS=ON -DNS3_EXAMPLES=ON .. && cd ..
+
 ./ns3 build
+
+# 原版 DSDV 回归（期望：PASS routing-dsdv）
+./test.py -s routing-dsdv
 
 # 多路径 + GNN 观测验证（期望：PASSED=18 FAILED=0）
 ./build/scratch/ns3.40-test-mp-dsdv-gnn-default
 ```
+
+> 若跳过 `-DNS3_TESTS=ON`，测试二进制不会随头文件重建，会产生看似是代码缺陷的
+> 假崩溃。详见 [ns3/README.md](ns3/README.md) 的"已知陷阱"一节。
 
 ### 3. 跑 ns3-ai 联合仿真（ns-3 ↔ Python 共享内存闭环）
 
