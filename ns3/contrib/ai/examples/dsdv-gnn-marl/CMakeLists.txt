@@ -9,3 +9,10 @@ set_target_properties(ns3ai_dsdv_gnn_marl_py PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_dependencies(ns3ai_dsdv_gnn_marl ns3ai_dsdv_gnn_marl_py)
+
+build_lib_example(
+    NAME ns3ai_dsdv_gnn_full_demo
+    SOURCE_FILES dsdv_gnn_full_demo.cc
+    LIBRARIES_TO_LINK ${libai} ${libdsdv} ${libwifi} ${libinternet} ${libapplications} ${libmobility} ${libnetwork}
+)
+add_dependencies(ns3ai_dsdv_gnn_full_demo ns3ai_dsdv_gnn_marl_py)

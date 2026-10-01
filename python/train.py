@@ -1,11 +1,15 @@
 """
-MAPPO 训练入口脚本
-Task 1.4：用随机/学习策略跑通完整训练流程
+MAPPO 训练入口脚本（轻量仿真器版）
+
+当前用途：在 NetworkX 轻量仿真器上跑通完整训练流程（MLP Actor/Critic）。
+第 4 章的 GNN Actor 与第 5 章的改进 MAPPO 尚未接入，见 docs/01_实施计划.md。
 
 用法：
-    cd /home/wuconan/Qoder/MARL
-    source /home/wuconan/marl_env/bin/activate
+    source ~/marl_env/bin/activate
+    cd <仓库根目录>
     python python/train.py [--config python/configs/default.yaml]
+
+产物：TensorBoard 日志写入 results/logs/，模型检查点写入 results/models/。
 """
 
 import os

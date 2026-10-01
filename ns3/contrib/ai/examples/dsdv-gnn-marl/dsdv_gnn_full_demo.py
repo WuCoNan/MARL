@@ -9,6 +9,13 @@ import torch
 from torch_geometric.data import Data
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from ns3_paths import ensure_ns3ai_utils_on_path, resolve_ns3_root
+
+# ns-3 根目录：优先 NS3_ROOT 环境变量，其次向上查找，最后回退默认安装路径
+NS3_ROOT = resolve_ns3_root(__file__)
+ensure_ns3ai_utils_on_path(NS3_ROOT)
+
 import ns3ai_dsdv_gnn_marl_py as py_binding
 from ns3ai_utils import Experiment
 
@@ -104,7 +111,8 @@ def verify_observation(data, step):
 
 def main():
     print("[Python] 6-node grid verification")
-    ns3_root = "/home/wuconan/ns-allinone-3.40/ns-3.40"
+    ns3_root = NS3_ROOT
+    print(f"[Python] ns3 root: {ns3_root}")
 
     exp = Experiment("ns3ai_dsdv_gnn_full_demo", ns3_root, py_binding,
                      handleFinish=True, useVector=True, vectorSize=1)
