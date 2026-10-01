@@ -1,0 +1,39 @@
+# Task 1.4 默认超参配置
+# 目标：验证训练流程跑通，不追求效果
+
+# 环境配置
+env:
+  num_nodes: 10              # 节点数
+  max_degree: 6              # 最大邻居数（动作空间大小）
+  buffer_capacity: 100       # 节点缓冲区容量 (packets)
+  link_bandwidth: 10         # 链路带宽 (packets/step)
+  num_flows: 3               # 流量流数量
+  episode_length: 50         # 每 episode 步数
+  topology_type: "random_geometric"  # 拓扑类型: random_geometric / erdos_renyi
+  connectivity_radius: 0.4   # 随机几何图连接半径
+  er_probability: 0.4        # ER 图连接概率
+  reward_weights: [1.0, 0.5, 1.0]  # [吞吐量, 时延, 丢包] 权重
+
+# MAPPO 训练配置
+training:
+  num_episodes: 100          # 总 episode 数
+  gamma: 0.99                # 折扣因子
+  gae_lambda: 0.95           # GAE lambda
+  lr: 3.0e-4                 # 学习率
+  clip_epsilon: 0.2          # PPO clip 范围
+  entropy_coef: 0.01         # 熵正则系数
+  value_coef: 0.5            # Critic loss 系数
+  max_grad_norm: 0.5         # 梯度裁剪
+  ppo_epochs: 4              # 每次更新的 epoch 数
+  hidden_dim: 64             # MLP 隐藏层维度
+
+# 日志配置
+logging:
+  log_dir: "results/logs"    # TensorBoard 日志目录
+  save_dir: "results/models" # 模型保存目录
+  log_interval: 10           # 每 N episodes 打印一次
+  save_interval: 50          # 每 N episodes 保存一次模型
+
+# 设备
+device: "cpu"                # 训练设备 (cpu / cuda)
+seed: 42                     # 随机种子

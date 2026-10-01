@@ -1,0 +1,1306 @@
+# 改进DSDV协议算法设计（MP-DSDV-GNN）v3 — 实现对齐版
+
+> 本文档与代码实现一一对应，所有算法步骤均可在源码中找到对应函数。
+
+## 一、协议总览
+
+协议名称：**MP-DSDV-GNN**（Multipath DSDV with GNN-oriented Observation）
+
+三大改进维度：
+1. **多路径路由表**：每个目的维护最多K条不相交路径（被动发现，零额外控制包）
+2. **特征采集与传播**：每1s广播 {自身节点特征 + 所有直连邻居的节点特征 + 所有直连链路特征(4维)}
+3. **GNN观测区生成**：每10ms从路由表+FeatureStore构建结构化PyG图，通过ns3-ai共享内存传给Python
+
+设计约束：
+- 2层GNN严格对应2-hop观测范围
+- 1-hop邻居集合由**路由表hop=1条目**确定（非FeatureStore）
+- 多路径候选下一跳 = GNN动作空间
+- 所有特征分布式本地可得，无需集中控制器
+- 目标网络规模：20-50节点
+
+---
+
+## 二、数据结构定义
+
+### 2.1 多路径路由表
+
+```
+实现文件: dsdv-rtable.h / dsdv-rtable.cc
+
+RoutingTable:
+  m_ipv4AddressEntry: Map<Ipv4Address, RoutingTableEntry>   // 主路径（每dest一条）
+  m_multipathEntries: Map<Ipv4Address, vector<RoutingTableEntry>>  // 备份路径
+
+约束:
+  - K_MAX = 5（每dest最大路径数，含主路径）
+  - DELTA = 1（备份路径hop <= 主路径hop + 1）
+  - 同一dest下所有路径的next_hop互不相同（第一跳不相交）
+
+API:
+  AddMultipathRoute(rt)         // 添加备份路径（自动检查约束）
+  GetAllPaths(dst, paths)       // 获取主+所有备份
+  GetBackupPaths(dst, paths)    // 仅获取备份
+  DeleteMultipathByNextHop(nh)  // 删除经某next_hop的所有备份
+  ClearMultipath(dst)           // 清空某dest的所有备份
+  GetPathCount(dst)             // 路径总数
+  HasMultipathNextHop(dst, nh)  // 检查某备份是否存在
+  RefreshMultipathLifetime(dst, nh)  // 刷新备份存活时间
+  UpdateMultipathSeq(dst, seq)  // 同步所有备份的seq号
+```
+
+### 2.2 邻居特征存储（FeatureStore）
+
+```
+实现文件: dsdv-feature-store.h / dsdv-feature-store.cc
+
+FeatureStore:
+  m_entries: Map<Ipv4Address, NbrFeatureEntry>
+
+NbrFeatureEntry {
+    nbrId:        Ipv4Address              // 邻居地址
+    selfFeature:  NodeFeature              // 邻居的自身节点特征（来自其广播Part1）
+    linkFeatures: vector<LinkFeature>      // 邻居的所有直连链路特征（来自其广播Part3）
+    nbrFeatures:  Map<Ipv4Address, NodeFeature>  // 邻居的邻居的节点特征（来自其广播Part2）
+    lastUpdate:   Time                     // 最后更新时间
+}
+
+NodeFeature {              // 节点特征（广播中传输的4个字段）
+    queueRatio:   float    // 队列占用率 [0,1]
+    numNeighbors: uint8    // 邻居数（路由表hop=1计数）
+    localLoad:    float    // 本地转发负载 [0,2]
+    bufferUsage:  float    // 缓冲区使用率 [0,1]
+}
+
+LinkFeature {              // 链路特征（广播中传输的4个字段 + peerId）
+    peerId:     Ipv4Address  // 链路对端
+    etx:        float        // link_quality: SNR归一化 [0,1]
+    linkLoad:   float        // link_utilization: 字节/速率 [0,2]
+    bandwidth:  float        // link_reliability: MAC交付率 [0,1]
+    stability:  float        // link_stability: 路由存活率 [0,1]
+}
+```
+
+### 2.3 GNN观测区（GnnObservation）
+
+```
+实现文件: dsdv-gnn-observer.h / dsdv-gnn-observer.cc
+
+GnnObservation {
+    nodeIds:      vector<Ipv4Address>          // 节点ID列表（[0]=self）
+    nodeFeatures: vector<vector<float>>        // [numNodes × 6] 节点特征矩阵
+    edgeIndex:    vector<pair<uint32,uint32>>  // 边索引（COO格式）
+    edgeFeatures: vector<vector<float>>        // [numEdges × 4] 边特征矩阵
+    multipathInfo: vector<MultipathEntry>      // 多路径候选信息
+    numNodes, numEdges, num1Hop, num2Hop: uint32
+    pathDiversity: float                       // 平均路径数
+}
+
+节点特征 (NODE_FEAT_DIM = 6):
+  [0] queue_ratio      - 本地队列占用率 [0,1]
+  [1] num_neighbors    - 1-hop邻居数 / 20.0
+  [2] num_2hop         - 2-hop邻居数 / 20.0
+  [3] local_load       - 转发字节/链路容量 [0,2]
+  [4] avg_nbr_queue    - 邻居平均队列占用率 [0,1]
+  [5] path_diversity   - 到各目的平均可用路径数 [1,K_MAX]
+
+边特征 (EDGE_FEAT_DIM = 4):
+  [0] link_quality     - 10s窗口SNR归一化（PHY MonitorSnifferRx Trace）[0,1]
+  [1] link_utilization - 1s窗口转发字节/链路速率（RouteOutput统计）[0,2]
+  [2] link_reliability - 10s窗口MAC帧交付率（MacTx/MacTxDrop Trace）[0,1]
+  [3] link_stability   - 路由表存活时间占比（每秒LookupRoute轮询）[0,1]
+```
+
+### 2.4 ns3-ai共享内存接口
+
+```
+实现文件: dsdv_gnn_marl_msg.h
+
+GnnObsMsg (C++ → Python):
+  numNodes, numEdges, numNeighbors: uint32
+  pathDiversity: float
+  nodeFeatures[MAX_NODES × 6]: float[]   // 展平的节点特征
+  edgeFeatures[MAX_EDGES × 4]: float[]   // 展平的边特征
+  edgeSrc[MAX_EDGES], edgeDst[MAX_EDGES]: uint32[]  // 边索引
+
+GnnActionMsg (Python → C++):
+  probs[MAX_NEIGHBORS]: float[]  // 对各邻居的流量分配比例（softmax输出，和为1）
+
+常量: MAX_NODES=20, MAX_EDGES=80, MAX_NEIGHBORS=10
+```
+
+---
+
+## 三、多路径路由发现与维护
+
+### 3.1 多路径发现（被动，零额外控制包）
+
+```
+实现位置: dsdv-routing-protocol.cc → RecvDsdv()
+
+触发条件: 收到DSDV路由更新包，处理每个条目(dest=D, seq, hop)时：
+
+情况A: 同seq + 同/更差hop + 不同next_hop
+  → 尝试添加为备份路径:
+    if (sender != primary_next_hop):
+        if (HasMultipathNextHop(D, sender)):
+            RefreshMultipathLifetime(D, sender)   // 已有→刷新存活
+        else:
+            AddMultipathRoute(entry)              // 新的→添加（自动检查K_MAX/DELTA/不相交）
+
+情况B: 更好seq + next_hop改变
+  → 旧主路径降级为备份:
+    demoted = old_primary_entry
+    AddMultipathRoute(demoted)       // 旧主路径变备份
+    DeleteMultipathByNextHop(sender) // 避免新主路径的next_hop重复出现在备份中
+    UpdateMultipathSeq(D, new_seq)   // 所有备份seq同步
+
+情况C: 更好seq + 同next_hop
+  → 保留所有备份，仅同步seq:
+    UpdateMultipathSeq(D, new_seq)
+
+情况D: 同seq + 更好hop + 不同next_hop
+  → 旧主路径降级为备份，新路径成为主路径:
+    AddMultipathRoute(old_primary)
+    UpdateMultipathSeq(D, seq)
+```
+
+### 3.2 多路径清理
+
+```
+实现位置: OnLinkBreak(nbr)
+
+1. 删除所有next_hop==nbr的主路径条目
+2. DeleteMultipathByNextHop(nbr)  // 删除所有经nbr的备份
+3. FeatureStore.DeleteEntry(nbr)  // 清除特征
+4. SendSuppressedTriggeredUpdate()  // 通知全网（1s抑制窗口）
+```
+
+---
+
+## 四、特征广播机制
+
+### 4.1 广播包格式
+
+```
+实现文件: dsdv-feature-packet.h / dsdv-feature-packet.cc
+
+FeatureBroadcastPacket（每1s广播，magic=0xFF区分于路由更新）:
+  Part 1: self_feature (16B)
+    queueRatio(4B) + numNeighbors(1B+3B padding) + localLoad(4B) + bufferUsage(4B)
+
+  Part 2: neighbor_features (1B count + N × 20B)
+    对每个邻居j: addr(4B) + queueRatio(4B) + numNeighbors(1B+3B) + localLoad(4B) + bufferUsage(4B)
+
+  Part 3: link_features (1B count + N × 20B)
+    对每个邻居j: addr(4B) + quality(4B) + utilization(4B) + reliability(4B) + stability(4B)
+
+典型大小: 度5节点 → 1 + 16 + 1 + 5×20 + 1 + 5×20 = 218 bytes
+```
+
+### 4.2 发送算法
+
+```
+实现位置: SendFeatureBroadcast()（每1s + 随机jitter≤0.5ms）
+
+1. 从路由表hop=1条目确定当前活跃邻居集合:
+   for each entry in RoutingTable where hop==1:
+       加入邻居集合
+
+2. 采集自身状态 → self_feature:
+   queueRatio  = m_queue.GetSize() / m_maxQueueLen
+   numNeighbors = 路由表hop=1条目计数
+   localLoad   = 过去1s转发字节 / (11Mbps/8 × 1s)
+   bufferUsage = queueRatio
+
+3. 计算所有直连链路特征 → link_features[]:
+   ComputeLinkFeatures()  // 从累积统计计算4维
+   for each neighbor in 路由表hop=1:
+       lf.quality     = avgSnr / 25.0 (clamp [0,1])     // PHY Trace 10s窗口
+       lf.utilization = txBytes / capacity (clamp [0,2]) // RouteOutput 1s窗口
+       lf.reliability = macTxSuccess / (success+fail)    // MAC Trace 10s窗口
+       lf.stability   = aliveSeconds / totalSeconds      // 路由表轮询 累积
+
+4. 组装广播包: {self_feature, m_nbrNodeFeatures, m_selfLinkFeatures}
+5. 广播到所有接口（端口269，magic=0xFF）
+```
+
+### 4.3 接收算法
+
+```
+实现位置: RecvDsdv()（检测magic=0xFF后分流）
+
+1. 反序列化 FeatureBroadcastHeader
+2. FeatureStore.UpdateEntry(sender, selfFeature, linkFeatures, nbrFeatures)
+3. m_nbrNodeFeatures[sender] = senderSelfFeature  // 存储用于自己下次广播Part2
+4. MAC→IP学习: m_macToIpMap[m_lastRxMac] = sender  // 关联PHY层MAC与网络层IP
+```
+
+### 4.4 信息传播范围（保证恰好2-hop）
+
+```
+节点i广播的内容:
+  [传播] i自己的节点特征           ← i自己测量
+  [传播] i所有直连链路的4维特征    ← i自己测量（PHY/MAC/RouteOutput Trace）
+  [传播] i的所有直连邻居的节点特征 ← 邻居之前广播给i的（i代为传播）
+
+  [不传播] 邻居的链路特征          ← 只用于本节点GNN
+  [不传播] 路由表信息              ← 由路由更新包单独负责
+
+为什么恰好2-hop:
+  A收到B的广播 → A得到B的nbr_features（含E）→ A知道E的节点特征（2-hop）
+  A不会把E的特征再传出去 → 信息传播恰好2跳
+```
+
+---
+
+## 五、链路特征采集（跨层Trace）
+
+### 5.1 四维链路特征计算
+
+```
+实现位置: ComputeLinkFeatures()（每1s调用）+ PhyRxMonitor/MacTxOk/MacTxDrop回调
+
+[0] link_quality (PHY层):
+  数据源: MonitorSnifferRx Trace → SignalNoiseDbm
+  计算: SNR = signal - noise (dB)
+        quality = clamp(avgSnr / 25.0, 0, 1)
+  窗口: 10s（每10次ComputeLinkFeatures重置sumSnr/snrCount）
+  归属: PhyRxMonitor中提取发送者MAC → MacToIpHeuristic → 只累积到特定邻居
+
+[1] link_utilization (网络层):
+  数据源: RouteOutput中 m_linkStats[nextHop].txBytes += packet->GetSize()
+  计算: utilization = txBytes / (11Mbps/8 × 1s)，clamp [0, 2]
+  窗口: 1s（每次ComputeLinkFeatures后重置txBytes）
+
+[2] link_reliability (MAC层):
+  数据源: MacTx Trace → macTxSuccess++; MacTxDrop Trace → macTxFail++
+  计算: reliability = macTxSuccess / (macTxSuccess + macTxFail)
+  窗口: 10s（与quality同窗口重置）
+  归属: 从MacHeader.GetAddr1()提取目的MAC → MacToIpHeuristic → 归属到特定邻居
+
+[3] link_stability (路由层):
+  数据源: 每秒执行 m_routingTable.LookupRoute(nbr)
+  计算: stability = aliveSeconds / totalSeconds（累积，不重置）
+  含义: 该邻居在路由表中持续可达的时间占比
+```
+
+### 5.2 MAC→IP映射学习
+
+```
+实现位置: PhyRxMonitor() + RecvDsdv()
+
+机制:
+  1. PhyRxMonitor: 每收到一帧，记录 m_lastRxMac = 帧的发送者MAC (Addr2)
+  2. RecvDsdv: 收到特征广播/路由更新时，知道sender IP（来自socket）
+     → m_macToIpMap[m_lastRxMac] = sender
+  3. MacToIpHeuristic(mac): 查m_macToIpMap，找到则返回IP，否则返回空
+
+原理: WiFi半双工，PHY层收到的最后一帧就是触发socket回调的那帧
+```
+
+---
+
+## 六、GNN观测区生成算法
+
+### 6.1 生成时机
+
+```
+实现位置: GenerateGnnObservation()（每10ms定时调用）
+
+调用: m_gnnObserver.GenerateGnnObs(m_mainAddress, m_routingTable, m_featureStore,
+                                    m_selfFeature, m_selfLinkFeatures, m_latestGnnObs)
+```
+
+### 6.2 生成算法
+
+```
+实现位置: dsdv-gnn-observer.cc → GenerateGnnObs()
+
+// ========== 第一步: 确定节点集合 ==========
+node_set = {self}
+
+// 1-hop邻居: 从路由表hop=1条目获取（非FeatureStore）
+for each entry in RoutingTable where hop==1 and not broadcast:
+    node_set.add(entry.dest)
+    node_feature = FeatureStore[dest].selfFeature (若有) 或 默认值
+
+// 2-hop邻居: 从FeatureStore[N].linkFeatures获取
+for each N in FeatureStore:
+    for each link in FeatureStore[N].linkFeatures:
+        if link.peerId != self and link.peerId not in node_set:
+            node_set.add(link.peerId)
+            node_feature = Get2HopFeature(link.peerId)  // 从N的nbr_features中查
+
+// ========== 第二步: 构建节点特征（BuildNodeFeature）==========
+对每个节点v:
+  feat[0] = nf.queueRatio                              // 队列占用率
+  feat[1] = nf.numNeighbors / 20.0                     // 邻居数归一化
+  feat[2] = count(FeatureStore[v].linkFeatures中非self非v的) / 20.0  // 2-hop数
+  feat[3] = nf.localLoad                               // 本地负载
+  feat[4] = avg(FeatureStore所有邻居的queueRatio)       // 邻居平均拥塞
+  feat[5] = avg(RoutingTable所有dest的GetPathCount)     // 路径多样性
+
+// ========== 第三步: 构建边集合（BuildEdgeFeature）==========
+// 1-hop边: self → 各邻居（从m_selfLinkFeatures，基于路由表hop=1）
+for each link in selfLinks:
+    edge(self, link.peerId)
+    edge_feat = [link.etx, link.linkLoad, link.bandwidth, link.stability]
+
+// 补全: 路由表hop=1但无链路特征的邻居 → 用默认值[1,0,1,1]
+for each nbr in nbrList where edge not exists:
+    edge(self, nbr) with default features
+
+// 2-hop边: 邻居 → 邻居的邻居（从FeatureStore[N].linkFeatures）
+for each N in FeatureStore:
+    for each link in FeatureStore[N].linkFeatures:
+        if link.peerId in node_set and link.peerId != self:
+            edge(N, link.peerId)
+            edge_feat = [link.etx, link.linkLoad, link.bandwidth, link.stability]
+
+// ========== 第四步: 多路径信息 ==========
+for each dest D in RoutingTable where hop > 0:
+    pathCount = GetPathCount(D)
+    if pathCount > 1:
+        multipathInfo.add({dest=D, primary=主路径next_hop,
+                          candidates=所有路径next_hop, hopCounts=各路径hop})
+pathDiversity = avg(pathCount for all active dest)
+```
+
+### 6.3 Python侧PyG图构建
+
+```
+实现位置: dsdv_gnn_marl.py → build_pyg_graph()
+
+data = Data(
+    x = Tensor[numNodes, 6],        # 节点特征
+    edge_index = Tensor[2, numEdges], # 边索引（COO）
+    edge_attr = Tensor[numEdges, 4],  # 边特征
+)
+
+动作空间推导:
+  self_mask = (edge_index[0] == 0)       # self(node0)的出边
+  action_targets = edge_index[1][self_mask]  # 邻居节点索引
+  action_dim = len(action_targets)        # = 1-hop邻居数
+  action_edge_feats = edge_attr[self_mask]  # 各邻居的链路状态
+
+GNN消息传递:
+  Layer 1: 2-hop节点 → 1-hop节点（聚合远端信息）
+  Layer 2: 1-hop节点 → self（聚合完整2-hop邻域表征）
+  Actor头: self嵌入 + 各邻居边特征 → softmax → 流量分配比例
+```
+
+---
+
+## 七、ns3-ai联合仿真流程
+
+### 7.1 每个Time Slot (10ms)
+
+```
+实现位置: dsdv_gnn_marl.cc (C++) + dsdv_gnn_marl.py (Python)
+
+[ns-3 C++ 侧]
+  1. Simulator::Run() 推进10ms仿真
+  2. 从 m_latestGnnObs 读取当前GNN观测
+  3. FillObsMsg(): 将GnnObservation序列化到共享内存GnnObsMsg
+  4. CppSendEnd(): 通知Python数据就绪
+
+[Python 侧]
+  5. PyRecvBegin(): 等待ns-3数据
+  6. build_pyg_graph(): 从GnnObsMsg构建PyG Data对象
+  7. GNN Actor前向推理 → softmax → 流量分配比例
+  8. PySendEnd(): 将action写入共享内存
+
+[ns-3 C++ 侧]
+  9. CppRecvBegin(): 读取Python返回的action
+  10. 解析probs[] → 应用到转发逻辑（按概率分配到各邻居）
+```
+
+### 7.2 后台周期任务
+
+```
+每1s: SendFeatureBroadcast()
+  - 采集自身状态 + 计算链路特征 + 广播
+  - 随机jitter ≤ 0.5ms 避免碰撞
+
+每2s: SendPeriodicUpdate()（DSDV原生路由更新）
+  - 全量广播路由表最优路径
+  - 多路径在此过程中被动发现
+
+每10ms: GenerateGnnObservation()
+  - 重建完整ego图（节点+边+特征+多路径信息）
+```
+
+### 7.3 事件驱动
+
+```
+OnLinkBreak(nbr):
+  1. 删除经nbr的所有主路径 + 备份路径
+  2. FeatureStore.DeleteEntry(nbr)
+  3. m_nbrNodeFeatures.erase(nbr)
+  4. SendSuppressedTriggeredUpdate()（1s抑制窗口）
+
+OnNewNeighbor(nbr):
+  1. FeatureStore.CreateEntry(nbr)（空条目，等待广播填充）
+  2. SendSuppressedTriggeredUpdate()
+```
+
+---
+
+## 八、关键设计参数
+
+| 参数 | 值 | 说明 |
+|------|:---:|------|
+| K_MAX | 5 | 每dest最大路径数 |
+| DELTA | 1 | 备份路径允许的额外跳数 |
+| FEATURE_BROADCAST_INTERVAL | 1s | 特征广播周期 |
+| PERIODIC_UPDATE_INTERVAL | 2s | 路由更新周期（测试用，正式15s） |
+| TIME_SLOT | 10ms | GNN决策周期 |
+| TRIGGER_MIN_INTERVAL | 1s | 触发更新最小间隔 |
+| SNR_MAX_DB | 25.0 | SNR归一化上限 |
+| DEFAULT_LINK_RATE | 11Mbps/8 | 802.11b链路速率 |
+| MAX_NODES | 20 | 共享内存最大节点数 |
+| MAX_EDGES | 80 | 共享内存最大边数 |
+| NODE_FEAT_DIM | 6 | 节点特征维度 |
+| EDGE_FEAT_DIM | 4 | 边特征维度 |
+
+---
+
+## 九、源码文件对照
+
+| 文件 | 职责 |
+|------|------|
+| dsdv-rtable.h/cc | 多路径路由表（主路径+备份路径管理） |
+| dsdv-feature-store.h/cc | 邻居特征存储（1-hop完整信息+2-hop节点特征） |
+| dsdv-feature-packet.h/cc | 特征广播包序列化/反序列化 |
+| dsdv-gnn-observer.h/cc | GNN观测区生成（BuildNodeFeature + BuildEdgeFeature） |
+| dsdv-routing-protocol.h/cc | 协议主体（多路径发现/特征广播/链路Trace/事件处理） |
+| dsdv_gnn_marl_msg.h | ns3-ai共享内存数据结构定义 |
+| dsdv_gnn_marl.cc | ns-3侧联合仿真入口 |
+| dsdv_gnn_marl_py.cc | pybind11绑定 |
+| dsdv_gnn_marl.py | Python侧（PyG图构建+GNN推理+验证） |
+
+---
+
+## 十、与原始设计v2的差异说明
+
+| 项目 | v2设计 | v3实现 | 原因 |
+|------|--------|--------|------|
+| 节点特征维度 | 7维（含traffic_role） | **6维**（移除traffic_role） | 冗余：决策问题相同，信息已被其他维度隐含 |
+| 边特征[2] | is_primary_path | **link_reliability** | 用户确认修改：MAC交付率比二值标记信息量更大 |
+| 边特征[3] | hop_to_dest | **link_stability** | 用户确认修改：路由存活率反映链路动态性 |
+| 1-hop邻居来源 | FeatureStore | **路由表hop=1** | 修复bug：FeatureStore可能遗漏已确认的直连邻居 |
+| 多路径维护 | 主路径变→ClearMultipath | **降级+seq同步+lifetime刷新** | 避免备份路径被无谓清除 |
+| MAC→IP映射 | 未设计 | **协议交互学习** | PhyRxMonitor记录MAC + RecvDsdv关联IP |
+| ns3-ai接口 | 未设计 | **共享内存GnnObsMsg/GnnActionMsg** | 已实现端到端闭环 |
+| 特征存储类型 | array<float, N> | **vector<float>** | 支持实验时动态调整特征维度 |
+# 改进DSDV协议完整算法设计（MP-DSDV-GNN）v2
+
+## 一、协议总览
+
+协议名称：**MP-DSDV-GNN**（Multipath DSDV with GNN-oriented Observation）
+
+三大改进维度：
+1. **多路径路由表**：每个目的节点维护多条不相交路径（被动发现，零额外控制包）
+2. **特征采集与传播**：节点广播 {自身节点特征 + 所有直连邻居的节点特征 + 所有直连链路特征}，邻居存储但不转发
+3. **GNN观测区**：每个节点从路由表+特征存储中生成结构化的GNN输入数据
+
+设计约束：
+- 2层GNN严格对应2-hop观测范围，2-hop节点拥有真实节点特征（由1-hop邻居代为广播）
+- 多路径候选下一跳 = GNN动作空间
+- 所有特征均为分布式本地可得，无需集中控制器
+- 时间槽（time slot）= 10ms，每槽重建GNN观测区
+- 目标网络规模：20-50节点
+- 特征生命周期与DSDV路由条目绑定，无独立过期机制
+
+---
+
+## 二、数据结构定义
+
+### 2.1 多路径路由表（Multipath Routing Table）
+
+```
+RoutingTable[node_i]:
+┌─────────────────────────────────────────────────────────────────┐
+│  对每个目的节点 D，维护一个 PathEntry 列表：                       │
+│                                                                   │
+│  PathEntry {                                                      │
+│      dest:        NodeID       // 目的节点                        │
+│      next_hop:    NodeID       // 下一跳（不同路径的next_hop互不相同）│
+│      hop_count:   uint8        // 经此下一跳到D的跳数              │
+│      dest_seq:    uint32       // D的最新序列号                    │
+│      cost:        float        // 路径代价（默认=hop_count）       │
+│      is_primary:  bool         // 是否主路径（cost最小者）          │
+│      install_time: Time        // 安装时间（用于过期）             │
+│  }                                                                │
+│                                                                   │
+│  约束：                                                            │
+│  - 同一dest下，所有PathEntry的next_hop互不相同（节点不相交第一跳）  │
+│  - 最多保留 K_MAX 条路径（默认 K_MAX = 5）                        │
+│  - 仅保留 hop_count <= best_hop + DELTA 的路径（DELTA = 1）       │
+│  - 按 cost 升序排列，cost最小且seq最新者为 primary                 │
+│                                                                   │
+│  过期规则（DSDV原生）：                                            │
+│  - 若 now - install_time > ROUTE_TIMEOUT → 删除该条目             │
+│  - ROUTE_TIMEOUT = 3 * PERIODIC_UPDATE_INTERVAL                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 邻居特征存储（Neighbor Feature Store）
+
+```
+FeatureStore[node_i]:
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                   │
+│  // === 1-hop邻居完整信息（来自邻居的直接广播）===                 │
+│  nbr_entries: Map<NodeID, NbrFeatureEntry>                        │
+│                                                                   │
+│  NbrFeatureEntry {                                                │
+│      nbr_id:         NodeID                                       │
+│      // --- N的自身节点特征（N在广播中报告的自己）---              │
+│      self_feature:   NodeFeature                                  │
+│      // --- N报告的所有直连链路特征 ---                            │
+│      link_features:  List<LinkFeature>                            │
+│      // --- N报告的所有直连邻居的节点特征 ---                      │
+│      nbr_features:   Map<NodeID, NodeFeature>                     │
+│      //     包含: N的所有邻居（含本节点i和2-hop节点如E）           │
+│  }                                                                │
+│                                                                   │
+│  // === 数据结构定义 ===                                          │
+│  NodeFeature {                                                    │
+│      queue_ratio:    float    // 队列占用率 [0,1]                 │
+│      num_neighbors:  uint8    // 邻居数                           │
+│      local_load:     float    // 本地流量负载                      │
+│      buffer_usage:   float    // 缓冲区使用率                      │
+│      // （可扩展）                                                │
+│  }                                                                │
+│                                                                   │
+│  LinkFeature {                                                    │
+│      peer_id:      NodeID     // 链路对端节点                      │
+│      etx:          float      // 链路质量 ETX [1, inf)            │
+│      link_load:    float      // 链路当前承载流量 [0,1]           │
+│      bandwidth:    float      // 链路带宽                         │
+│      // （可扩展）                                                │
+│  }                                                                │
+│                                                                   │
+│  生命周期管理（事件驱动 + 周期安全网）：                          │
+│  - 创建: OnNewNeighbor(N) 时立即创建空条目，等待特征广播填充    │
+│  - 删除: OnLinkBreak(N) 时立即删除（主要机制）              │
+│  - 安全网: RoutingTableMaintenance() 周期性检查并清理残留条目  │
+│  - 无独立过期定时器，复用DSDV的路由维护周期                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.3 本节点自身特征（Self Feature）
+
+```
+SelfFeature[node_i]:
+┌─────────────────────────────────────────────────────────────────┐
+│  node_id:        NodeID                                           │
+│  node_feature:   NodeFeature   // 本节点自身状态                  │
+│                                                                   │
+│  my_link_features: List<LinkFeature>  // 本节点所有直连链路特征    │
+│  // 由本节点自行测量维护:                                         │
+│  //   ETX: 基于最近N个Hello的丢包率估算                           │
+│  //   link_load: 过去1s内经该链路转发的流量/链路容量               │
+│                                                                   │
+│  my_nbr_features: Map<NodeID, NodeFeature>                        │
+│  // 本节点维护的所有直连邻居的节点特征副本                         │
+│  // 来源: 邻居的直接广播（与FeatureStore.nbr_entries[N].self_feature同步）│
+│  // 用途: 组装自己的特征广播包时，携带这些邻居特征                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.4 GNN观测区（GNN Observation Area）
+
+```
+GnnObsArea[node_i]:  // 每个time slot从上述数据源生成
+┌─────────────────────────────────────────────────────────────────┐
+│  // === 节点集合（全部拥有真实节点特征）===                         │
+│  nodes:                                                           │
+│    - self (node_i): 完整节点特征（SelfFeature）                    │
+│    - 1-hop neighbors: 完整节点特征（FeatureStore.nbr_entries[N].self_feature）│
+│    - 2-hop neighbors: 完整节点特征（FeatureStore.nbr_entries[N].nbr_features[E]）│
+│                                                                   │
+│  // === 边集合 ===                                                │
+│  edges:                                                           │
+│    - 1-hop物理边: (i, N), 完整4维边特征                           │
+│    - 2-hop远邻边: (N, E), 从N的link_features获得                  │
+│    - 多路径备选边: 标记 is_primary_path=0                         │
+│                                                                   │
+│  // === 多路径路由信息 ===                                         │
+│  multipath_info:                                                  │
+│    - 对每个活跃目的D: 候选下一跳列表 + 各路径hop_count             │
+│    - path_diversity: 平均可用路径数                                │
+│                                                                   │
+│  生成频率: 每 time slot (10ms) 重建                               │
+│  数据来源: RoutingTable + FeatureStore + SelfFeature              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、多路径路由发现与维护算法
+
+### 3.1 设计原则
+
+- **被动发现**：不引入任何额外控制包，仅修改DSDV周期性路由更新的处理逻辑
+- **第一跳不相交**：同一目的的多条路径必须有不同的next_hop（保证路径独立性）
+- **有界次优**：允许 hop_count <= best_hop + 1 的路径（增加路径多样性）
+- **序列号优先**：高seq的路由信息总是覆盖低seq（保持DSDV环路自由性）
+- **触发更新**：拓扑变化（链路断裂/新节点加入）时立即广播路由更新，不等待周期
+- **路由表驱动特征同步**：FeatureStore的增删由路由表变化事件驱动，保证两者始终一致
+
+### 3.2 路由更新包格式（修改后）
+
+```
+RouteUpdatePacket（由节点S周期性广播）:
+┌────────────────────────────────────────────┐
+│  sender:     NodeID (S)                     │
+│  sender_seq: uint32 (S的序列号)             │
+│  entries[]:                                 │
+│    对S路由表中每个目的D:                     │
+│    {                                        │
+│      dest:      NodeID                      │
+│      dest_seq:  uint32                      │
+│      hop_count: uint8  (S到D的最优跳数)     │
+│    }                                        │
+│  // 注意：不包含任何节点特征或链路特征        │
+│  // 注意：不暴露S的多路径列表                 │
+│  // 仅广播S的最优路径信息（与标准DSDV一致）   │
+└────────────────────────────────────────────┘
+```
+
+### 3.3 多路径路由更新处理算法
+
+```
+算法: ProcessRouteUpdate(packet, from_neighbor N)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+输入: 收到邻居N广播的RouteUpdatePacket
+输出: 更新本节点RoutingTable
+
+for each entry (dest=D, dest_seq=seq_D, hop_count=h_N) in packet.entries:
+
+    new_hop = h_N + 1          // 经N到D的跳数
+    new_cost = new_hop         // 默认代价=跳数（可扩展为加权）
+
+    // === 情况0: D就是本节点 ===
+    if D == self:
+        skip
+
+    // === 情况1: 路由表中无D的条目 ===
+    if RoutingTable[D] 不存在:
+        创建 RoutingTable[D]
+        添加 PathEntry{dest=D, next_hop=N, hop_count=new_hop,
+                       dest_seq=seq_D, cost=new_cost, is_primary=true}
+        continue
+
+    // === 情况2: 序列号更新（更新鲜的信息）===
+    if seq_D > RoutingTable[D].current_seq:
+        清空 RoutingTable[D] 的所有PathEntry
+        添加 PathEntry{dest=D, next_hop=N, hop_count=new_hop,
+                       dest_seq=seq_D, cost=new_cost, is_primary=true}
+        continue
+
+    // === 情况3: 序列号相同（同代信息）===
+    if seq_D == RoutingTable[D].current_seq:
+
+        best_hop = min(所有PathEntry的hop_count)
+
+        // 3a: 发现更短路径
+        if new_hop < best_hop:
+            清空所有PathEntry
+            添加 PathEntry{..., is_primary=true}
+
+        // 3b: 等跳数路径 → 添加为多路径
+        elif new_hop == best_hop:
+            if N 不在已有 next_hop 集合中:  // 第一跳不相交检查
+                if 路径数 < K_MAX:
+                    添加 PathEntry{..., is_primary=false}
+
+        // 3c: 多跳1的次优路径 → 有限度添加
+        elif new_hop == best_hop + 1:
+            if N 不在已有 next_hop 集合中:
+                if 路径数 < K_MAX:
+                    添加 PathEntry{..., is_primary=false}
+
+        // 3d: 更差的路径 → 丢弃
+        else:
+            skip
+
+    // === 情况4: 序列号更旧 ===
+    if seq_D < RoutingTable[D].current_seq:
+        skip  // 丢弃过时信息
+
+    // === 更新主路径标记 ===
+    重新排序 PathEntry by (cost ASC)
+    设 cost最小者为 is_primary = true
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 3.4 拓扑变化事件处理与触发更新
+
+```
+算法: OnTopologyEvent(event)  // 事件驱动，立即执行
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// === 事件类型1: 链路断裂（检测到邻居N不可达）===
+// 检测方式: 连续MISS_COUNT(=3)个Hello未收到N的响应 / MAC层链路失败通知
+OnLinkBreak(N):
+    1. RoutingTable: 删除所有 next_hop == N 的 PathEntry
+       对受影响的每个dest D:
+         若 RoutingTable[D] 还有其他路径 → 重新选举 primary
+         若 RoutingTable[D] 为空 → 删除 D 的条目
+    2. FeatureStore: 立即删除 FeatureStore[N]（包括N的自身特征、
+       N的链路特征、N报告的邻居特征 → 全部清除）
+    3. SelfFeature: 从 my_nbr_features 中删除 N
+       从 my_link_features 中删除到N的链路
+    4. 触发更新: 立即广播 RouteUpdatePacket（携带受影响的路由条目）
+       // 让全网尽快知道经N的路径已失效
+    5. GNN观测区: 下一个time slot自动反映变化（N及其2-hop信息消失）
+
+// === 事件类型2: 新邻居加入（首次收到节点N的路由更新/特征广播）===
+OnNewNeighbor(N):
+    1. RoutingTable: 添加经N的路径条目（按ProcessRouteUpdate正常处理）
+    2. FeatureStore: 创建 FeatureStore[N] 空条目
+       // 内容暂空，等待N的下一次特征广播填充
+    3. SelfFeature: 在 my_link_features 中添加到N的链路（初始ETX=1.0）
+    4. 触发更新: 立即广播 RouteUpdatePacket
+       // 告知全网自己有了新的路由选择
+
+// === 事件类型3: 链路质量显著变化（ETX突变）===
+OnLinkQualityChange(N, old_etx, new_etx):
+    if |new_etx - old_etx| > ETX_THRESHOLD (默认0.5):
+        1. 更新 SelfFeature.my_link_features[N].etx
+        2. 若 new_etx > ETX_MAX (默认5.0): 视为链路断裂 → OnLinkBreak(N)
+        3. 否则: 更新路径cost，可能触发primary切换
+           若primary发生变化 → 触发更新
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 3.5 路由表维护（周期性 + 事件驱动双机制）
+
+```
+算法: RoutingTableMaintenance()  // 周期性执行（安全网）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 注: 主要的增删由 OnTopologyEvent 事件驱动完成
+// 此周期性维护仅作为安全网，处理漏网之鱼
+
+for each dest D in RoutingTable:
+    for each PathEntry P in RoutingTable[D]:
+        if now - P.install_time > ROUTE_TIMEOUT:
+            删除 P
+    if RoutingTable[D] 为空:
+        删除 D 的条目
+    else:
+        重新选举 primary（cost最小者）
+
+// === 联动清理FeatureStore（安全网）===
+for each N in FeatureStore:
+    if N 不是本节点的当前直连邻居（按路由表/链路层判断）:
+        删除 FeatureStore[N]
+
+// === 路由更新广播策略 ===
+广播触发条件:
+  1. 周期性全量广播: 每 PERIODIC_UPDATE_INTERVAL (15s)
+  2. 触发式增量广播（拓扑变化时立即执行）:
+     - 链路断裂 → 广播受影响条目（hop=∞ 标记不可达）
+     - 新邻居加入 → 广播新增/更优路径
+     - primary路径切换 → 广播更新
+  3. 收到更高seq时立即转发（DSDV防环机制）
+
+触发更新抑制（防止广播风暴）:
+  - 最小触发间隔: TRIGGER_MIN_INTERVAL = 1s
+  - 若1s内多次拓扑变化 → 合并为一次触发更新
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 四、特征广播机制
+
+### 4.1 特征广播包格式（核心修改）
+
+```
+FeatureBroadcastPacket（由节点i周期性广播，TTL=1仅1-hop范围）:
+┌────────────────────────────────────────────────────────────────┐
+│  sender: NodeID (i)                                             │
+│  timestamp: Time                                                │
+│                                                                 │
+│  // === Part 1: 发送者自身的节点特征 ===                         │
+│  self_feature: NodeFeature {                                    │
+│      queue_ratio:    float   // i的队列占用率                    │
+│      num_neighbors:  uint8   // i的邻居数                       │
+│      local_load:     float   // i的本地流量负载                  │
+│      buffer_usage:   float   // i的缓冲区使用率                  │
+│  }                                                              │
+│                                                                 │
+│  // === Part 2: 发送者所有直连邻居的节点特征 ===                 │
+│  neighbor_features[]: {                                         │
+│      对每个邻居 j ∈ Neighbors(i):                               │
+│      {                                                          │
+│          node_id:       NodeID (j)                               │
+│          queue_ratio:   float  // j的队列占用率                  │
+│          num_neighbors: uint8  // j的邻居数                      │
+│          local_load:    float  // j的本地流量负载                │
+│          buffer_usage:  float  // j的缓冲区使用率                │
+│      }                                                          │
+│  }                                                              │
+│                                                                 │
+│  // === Part 3: 发送者所有直连链路的特征 ===                     │
+│  link_features[]: {                                             │
+│      对每个邻居 j ∈ Neighbors(i):                               │
+│      {                                                          │
+│          peer_id:    NodeID (j)                                  │
+│          etx:        float   // i→j 链路ETX（i自己测量）        │
+│          link_load:  float   // i→j 链路负载                    │
+│          bandwidth:  float   // 链路带宽                         │
+│      }                                                          │
+│  }                                                              │
+│                                                                 │
+│  // 重要规则：                                                   │
+│  // - Part 2中的邻居特征来自邻居之前的广播（i存储并转发）         │
+│  // - 不传播2-hop以远的信息（邻居的邻居的邻居不会出现）           │
+│  // - 不传播邻居的链路特征（只传邻居的节点特征）                  │
+│  // - 不包含路由表条目                                           │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 信息传播规则详解
+
+```
+核心规则：节点i广播的内容 = 自己的测量 + 自己存储的邻居节点特征
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"传播"与"不传播"的边界:
+  [传播] i自己的节点特征        ← i自己测量
+  [传播] i所有直连链路的特征    ← i自己测量
+  [传播] i的所有直连邻居的节点特征 ← 邻居之前广播给i的（i代为传播）
+  
+  [不传播] 邻居的链路特征       ← 只用于本节点GNN，不向外传
+  [不传播] 邻居的邻居的特征     ← 不存在于i的广播中（i只有直连邻居的特征）
+  [不传播] 路由表信息           ← 由路由更新包单独负责
+
+为什么这保证了2-hop且仅2-hop:
+  - A收到B的广播 → A得到B的邻居特征（含E） → A知道E（2-hop）
+  - A不会把E的特征再传出去 → C不会从A处得知E
+  - C只能从自己的邻居（如B）处得知E → 信息传播恰好2跳
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 4.3 特征广播发送算法
+
+```
+算法: SendFeatureBroadcast(node_i)  // 每 HELLO_INTERVAL 执行一次
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 前置说明: Neighbors(i) = 当前链路层确认的活跃直连邻居
+// 即: SelfFeature.my_link_features 中存在的邻居
+// 若某邻居已因OnLinkBreak删除 → 自然不会出现在广播中
+
+1. 采集本节点当前状态 → self_feature:
+   - queue_ratio = current_queue_size / max_queue_size
+   - num_neighbors = |当前活跃邻居列表|
+   - local_load = 过去1s内本节点产生+转发的流量(bit/s) / 标称容量
+   - buffer_usage = current_buffer / max_buffer
+
+2. 采集所有直连链路特征 → link_features[]:
+   for each neighbor j in SelfFeature.my_link_features:  // 仅当前活跃邻居
+       etx = 1 / (1 - p_loss)  // 基于最近10个Hello的丢包率
+       link_load = 过去1s内经i→j转发的流量 / 链路容量
+       bandwidth = 链路标称带宽
+
+3. 组装所有直连邻居的节点特征 → neighbor_features[]:
+   for each neighbor j in SelfFeature.my_nbr_features:  // 仅当前活跃邻居
+       // 此数据来源于j之前直接广播给i的self_feature
+       添加 {node_id=j, queue_ratio, num_neighbors, local_load, buffer_usage}
+
+4. 组装 FeatureBroadcastPacket{self_feature, neighbor_features, link_features}
+
+5. 广播到所有1-hop邻居（TTL=1，物理层广播，不转发）
+
+// === 拓扑变化后的自动一致性 ===
+// 场景: A-B链路断裂 → OnLinkBreak(B) 已删除B的所有信息
+// → 下次A的特征广播中:
+//    Part2 不包含B的节点特征 ✓
+//    Part3 不包含A-B链路特征 ✓
+//    A的邻居收到A的广播后，不再从A处获得B的信息 ✓
+
+// === 广播包大小估算（20-50节点网络）===
+// 典型场景: 20节点, 平均度=5
+//   Part1: 4 floats = 16B
+//   Part2: 5 * (2B ID + 16B features) = 90B
+//   Part3: 5 * (2B ID + 12B features) = 70B
+//   总计: ~180B/包, 每节点每1s一包
+//   全网开销: 20 * 180B = 3.6KB/s （远小于典型无线带宽）
+//
+// 极端场景: 50节点, 某节点度=20
+//   总计: ~550B/包 （仍可接受）
+//
+// 安全上限: 若邻居数 > MAX_NBR_IN_BROADCAST(=20):
+//   只包含ETX最优的前20个邻居的特征（按链路质量排序截断）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 4.4 特征广播接收算法
+
+```
+算法: ReceiveFeatureBroadcast(packet, from_neighbor N)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 前置检查
+if N 不是本节点的直连邻居:
+    丢弃  // 只接受1-hop邻居的广播（TTL=1应已保证）
+
+// === 存储N的自身节点特征 ===
+FeatureStore[N].self_feature = packet.self_feature
+// 同步更新 SelfFeature.my_nbr_features[N]（用于自己下次广播）
+SelfFeature.my_nbr_features[N] = packet.self_feature
+
+// === 存储N报告的所有直连链路特征 ===
+FeatureStore[N].link_features = packet.link_features
+// 包含: N-A, N-E, N-F 等所有N的直连链路
+// 本节点由此获知2-hop拓扑: N-E, N-F 等链路的存在和质量
+
+// === 存储N报告的所有直连邻居的节点特征 ===
+FeatureStore[N].nbr_features = packet.neighbor_features
+// 包含: A自己（可忽略）、E、F等2-hop节点的节点特征
+// 本节点由此获知2-hop节点的队列、负载等状态
+
+// === 关键规则 ===
+// 不转发此包的任何内容
+// 此信息仅用于: (1)本节点GNN观测区生成 (2)下次自己广播时携带邻居特征
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 4.5 信息传播范围分析（修正版）
+
+```
+信息传播示意（以节点A为中心）:
+
+    E ─── B ─── A ─── C ─── F
+              \  |  /
+               \ | /
+                 D
+
+B 的广播包内容:
+  self_feature: {B: queue=0.6, neighbors=3, load=...}
+  neighbor_features: [{A: queue=0.4,...}, {E: queue=0.7,...}, {D: queue=0.8,...}]
+  link_features: [{B-A, etx=1.2}, {B-E, etx=1.5}, {B-D, etx=1.1}]
+
+A 收到 B 的广播后，A 获知:
+  - B 的节点特征 ✓（self_feature）
+  - E 的节点特征 ✓（neighbor_features中的E条目）
+  - D 的节点特征 ✓（neighbor_features中的D条目）
+  - B-E 链路质量 ✓（link_features）
+  - B-D 链路质量 ✓（link_features）
+
+A 的完整2-hop感知:
+┌──────────────────────────────────────────────────────────────┐
+│  节点信息（全部有真实特征）:                                    │
+│    A: {queue=0.4, neighbors=3, load=...}  ← SelfFeature      │
+│    B: {queue=0.6, neighbors=3, load=...}  ← B的广播          │
+│    C: {queue=0.3, neighbors=2, load=...}  ← C的广播          │
+│    D: {queue=0.8, neighbors=3, load=...}  ← B和D的广播       │
+│    E: {queue=0.7, neighbors=2, load=...}  ← B的广播中nbr_features │
+│    F: {queue=0.2, neighbors=1, load=...}  ← C的广播中nbr_features │
+│                                                               │
+│  链路信息:                                                     │
+│    A-B: etx=1.2  ← A自己测量                                  │
+│    A-C: etx=1.0  ← A自己测量                                  │
+│    A-D: etx=1.3  ← A自己测量                                  │
+│    B-E: etx=1.5  ← B的广播                                   │
+│    B-D: etx=1.1  ← B的广播                                   │
+│    C-F: etx=2.1  ← C的广播                                   │
+│    D-E: etx=1.8  ← D的广播                                   │
+│                                                               │
+│  GNN可聚合: 完整的2-hop子网特征向量（所有节点有真实特征）       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 五、GNN观测区生成算法
+
+### 5.1 生成时机
+
+每个 time slot（10ms）开始时，在ns3将观测传给Python之前，每个节点独立执行 `GenerateGnnObs()`。
+
+### 5.2 生成算法
+
+```
+算法: GenerateGnnObs(node_i)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+输出: GnnObsArea 结构体（传给Python构建PyG图）
+
+// ========== 第一步: 确定节点集合 ==========
+node_set = {i}  // 自身
+for each N in FeatureStore (有效):
+    node_set.add(N)                    // 1-hop邻居
+    for each link in FeatureStore[N].link_features:
+        if link.peer_id != i:          // 排除回到自身的链路
+            node_set.add(link.peer_id) // 2-hop邻居
+
+// ========== 第二步: 构建节点特征（全部为真实特征）==========
+for each node v in node_set:
+    if v == i:
+        v.feature = BuildFullFeature(SelfFeature)  // 完整7维
+    elif v in FeatureStore (1-hop邻居):
+        v.feature = BuildFullFeature(FeatureStore[v].self_feature)  // 完整7维
+    else:  // 2-hop邻居
+        // 从某个1-hop邻居N的nbr_features中获取v的真实特征
+        for each N in FeatureStore:
+            if v in FeatureStore[N].nbr_features:
+                v.feature = BuildFullFeature(FeatureStore[N].nbr_features[v])
+                break  // 取第一个来源（多个来源可取最新）
+
+// BuildFullFeature: 将NodeFeature扩展为GNN的7维输入
+function BuildFullFeature(nf: NodeFeature) -> float[7]:
+    return [
+        nf.queue_ratio,                    // 队列占用率
+        normalize(nf.num_neighbors),       // 邻居数（归一化）
+        compute_2hop_count(node_id),       // 2-hop邻居数（从link_features统计）
+        get_traffic_role(node_id),         // 流量角色（源=1/目的=-1/中继=0）
+        nf.local_load,                     // 本地流量负载
+        compute_avg_nbr_queue(node_id),    // 邻居平均拥塞
+        compute_path_diversity(node_id)    // 可用路径数（从RoutingTable）
+    ]
+
+// ========== 第三步: 构建边集合与边特征 ==========
+edge_set = {}
+
+// 3a: 1-hop物理边（本节点到各邻居）
+for each N in FeatureStore (有效):
+    edge_set.add(i → N)
+    edge(i,N).feature = [
+        SelfFeature.my_link_features[N].etx,   // 链路质量
+        SelfFeature.my_link_features[N].link_load, // 链路负载
+        is_primary_path(i, N),                 // 是否主路径（查RoutingTable）
+        hop_to_dest_via(i, N)                  // 经N到主要目的的跳数
+    ]
+
+// 3b: 2-hop远邻边（邻居到其邻居）
+for each N in FeatureStore:
+    for each link in FeatureStore[N].link_features:
+        E = link.peer_id
+        if E != i and E in node_set:
+            if (N → E) not in edge_set:  // 避免重复
+                edge_set.add(N → E)
+                edge(N,E).feature = [
+                    link.etx,                    // 从N的广播
+                    link.link_load,              // 从N的广播
+                    is_primary_path(N, E),       // 查RoutingTable
+                    hop_to_dest_via(N, E)        // 查RoutingTable
+                ]
+
+// 3c: 多路径备选边标记
+for each dest D in RoutingTable:
+    primary_hop = RoutingTable[D].primary.next_hop
+    for each PathEntry P in RoutingTable[D]:
+        if P.next_hop != primary_hop:
+            if edge(i, P.next_hop) exists:
+                edge(i, P.next_hop).is_primary_path = 0  // 备选
+
+// ========== 第四步: 汇总多路径路由信息 ==========
+multipath_info = {}
+for each dest D in RoutingTable:
+    multipath_info[D] = {
+        candidates: [P.next_hop for P in RoutingTable[D]],
+        hop_counts: [P.hop_count for P in RoutingTable[D]],
+        primary: RoutingTable[D].primary.next_hop
+    }
+
+path_diversity = avg(|RoutingTable[D]| for all active D)
+
+// ========== 第五步: 打包输出 ==========
+return {
+    node_ids:      node_set,
+    node_features: {v: v.feature for v in node_set},  // 全部7维真实特征
+    edges:         edge_set,
+    edge_features: {e: e.feature for e in edge_set},  // 全部4维
+    multipath:     multipath_info,
+    self_id:       i
+}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 5.3 GNN观测区与PyG图的映射（Python侧）
+
+```
+Python侧收到 GnnObsArea 后构建 PyG Data 对象:
+
+data = Data(
+    x = Tensor[N, 7],           # 节点特征矩阵（全部真实特征）
+    edge_index = Tensor[2, E],  # 边索引
+    edge_attr = Tensor[E, 4],   # 边特征矩阵
+)
+
+其中:
+  N = |node_set| (自身 + 1-hop + 2-hop)，所有节点均有真实特征
+  E = |edge_set| (1-hop边 + 2-hop边)
+  节点0 = 自身（GNN输出动作以此为中心）
+
+GNN消息传递过程:
+  Layer 1: 2-hop节点 → 1-hop节点（聚合2-hop子网信息）
+  Layer 2: 1-hop节点 → 自身（聚合完整2-hop邻域表征）
+  → 自身节点经过2层消息传递后，拥有完整2-hop子网的特征向量
+```
+
+---
+
+## 六、完整协议工作流程
+
+### 6.1 初始化阶段
+
+```
+节点启动时:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 初始化 RoutingTable = {} (空)
+2. 初始化 FeatureStore = {} (空)
+3. 初始化 SelfFeature (采集本节点初始状态)
+4. 启动定时器:
+   - T_route_update: 每 PERIODIC_UPDATE_INTERVAL (15s) 广播路由更新
+   - T_feature_broadcast: 每 HELLO_INTERVAL (1s) 广播特征
+   - T_maintenance: 每 MAINTENANCE_INTERVAL (5s) 执行DSDV路由维护
+   - T_gnn_obs: 每 TIME_SLOT (10ms) 生成GNN观测区
+5. 立即发送一次路由更新（宣告自身存在: dest=self, seq=1, hop=0）
+6. 立即发送一次特征广播（让邻居知道自己的存在和状态）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 6.2 稳态运行（每个Time Slot）
+
+```
+每 10ms Time Slot:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[ns3 侧]
+  1. 仿真推进 10ms（处理包级事件：数据转发、队列更新等）
+  2. 更新 SelfFeature（队列、负载等实时变化）
+  3. 更新链路特征（ETX、链路负载）
+  4. 调用 GenerateGnnObs() → 写入共享内存
+  
+[Python 侧]
+  5. 从共享内存读取所有节点的 GnnObsArea
+  6. 构建 PyG 图（batch所有节点的局部图）
+  7. GNN Actor 前向推理 → 输出每节点的流量分配比例
+  8. 将 action 写入共享内存
+
+[ns3 侧]
+  9. 读取 action → 解析为每节点对各邻居的转发比例
+  10. 应用到转发逻辑：
+      对节点i的待转发队列中的包:
+        查 RoutingTable[dest] → 得到候选下一跳集合
+        按 GNN 输出的比例分配到各候选下一跳
+  11. 计算 reward（吞吐量、时延、丢包率）
+  12. 写入共享内存
+
+[Python 侧]
+  13. 读取 reward → 存入 Replay Buffer
+  14. (每K步) 执行 MAPPO 更新
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 6.3 周期性后台任务 + 事件驱动
+
+```
+事件驱动（立即执行，主要机制）:
+  - 链路断裂 → OnLinkBreak(N): 路由表+FeatureStore立即清除 + 触发更新
+  - 新邻居加入 → OnNewNeighbor(N): 路由表+FeatureStore立即添加 + 触发更新
+  - ETX突变 → OnLinkQualityChange(): 更新特征/可能触发切换
+
+周期性任务（安全网 + 常规维护）:
+  每 HELLO_INTERVAL (1s):
+    - 执行 SendFeatureBroadcast()（携带自身+邻居节点特征+链路特征）
+    - 检测邻居可达性（连续MISS_COUNT次未收到 → 触发OnLinkBreak）
+
+  每 PERIODIC_UPDATE_INTERVAL (15s):
+    - 执行 SendRouteUpdate()（全量广播路由表最优路径）
+
+  每 MAINTENANCE_INTERVAL (5s):
+    - 执行 RoutingTableMaintenance()（清理过期路由，安全网）
+    - 联动清理 FeatureStore（删除非当前邻居的残留条目）
+    - 重新计算各路径的 is_primary 标记
+```
+
+---
+
+## 七、转发决策与GNN动作执行
+
+### 7.1 GNN动作到转发规则的映射
+
+```
+算法: ApplyGnnAction(node_i, gnn_output)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+输入: GNN输出 = 对每个邻居的流量分配比例
+      gnn_output = {N1: 0.4, N2: 0.35, N3: 0.25}
+
+// 将GNN的全局比例映射到每个目的节点
+for each dest D in 活跃目的集合:
+    candidates = RoutingTable[D].next_hops  // 如 {N1, N2}
+    
+    // 从GNN输出中提取该目的候选下一跳的比例
+    raw_ratios = {N: gnn_output[N] for N in candidates}
+    
+    // 归一化（确保候选集内比例和为1）
+    total = sum(raw_ratios.values())
+    if total > 0:
+        forwarding_table[D] = {N: r/total for N, r in raw_ratios.items()}
+    else:
+        forwarding_table[D] = {primary: 1.0}  // 回退到主路径
+
+// 实际转发
+for each packet in send_queue:
+    D = packet.dest
+    按 forwarding_table[D] 的概率分布随机选择下一跳
+    转发到选中的下一跳
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 八、关键设计参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| K_MAX | 5 | 每目的最大路径数 |
+| DELTA | 1 | 允许的次优跳数容差 |
+| HELLO_INTERVAL | 1s | 特征广播周期 |
+| PERIODIC_UPDATE_INTERVAL | 15s | 路由更新周期（DSDV原生） |
+| ROUTE_TIMEOUT | 45s | 路由条目过期时间 = 3x更新周期（安全网） |
+| TIME_SLOT | 10ms | GNN决策周期 |
+| MAINTENANCE_INTERVAL | 5s | DSDV路由维护周期（安全网） |
+| MAX_NBR_IN_BROADCAST | 20 | 特征广播中邻居数上限（超出按ETX排序截断） |
+| TRIGGER_MIN_INTERVAL | 1s | 触发更新最小间隔（防广播风暴） |
+| MISS_COUNT | 3 | 连续未收到Hello次数→判定链路断裂 |
+| ETX_THRESHOLD | 0.5 | ETX突变触发更新的阈值 |
+| ETX_MAX | 5.0 | ETX超过此值视为链路断裂 |
+
+注：无独立FEATURE_EXPIRE参数。FeatureStore生命周期由拓扑事件驱动（OnLinkBreak立即删除），周期性维护仅作安全网。
+
+---
+
+## 九、与标准DSDV的差异总结
+
+| 方面 | 标准DSDV | MP-DSDV-GNN |
+|------|----------|-------------|
+| 路由表结构 | 每目的1条路径 | 每目的最多K条不相交路径 |
+| 路由更新处理 | 仅保留最优 | 保留等跳/次优路径 |
+| 更新策略 | 周期性 + 简单触发 | 周期性 + 事件触发（链路断裂/新节点/ETX突变） |
+| 控制包类型 | 仅路由更新 | 路由更新 + 特征广播(新增) |
+| 路由更新内容 | dest+seq+hop | 不变（不携带特征） |
+| 新增包 | 无 | FeatureBroadcastPacket(含邻居节点特征) |
+| 存储结构 | 路由表 | 路由表 + FeatureStore + GnnObsArea |
+| 特征与路由一致性 | 无 | 事件驱动同步（OnLinkBreak/OnNewNeighbor立即联动） |
+| 转发决策 | 固定最优下一跳 | GNN输出的比例分配 |
+| 额外开销 | 无 | 每节点每1s一个~180B特征广播包 |
+
+---
+
+## 十、设计备注
+
+1. **广播包大小**：20节点/度5网络约180B/包，全网3.6KB/s开销极小；50节点/度10约370B/包；设MAX_NBR_IN_BROADCAST=20作为安全阀
+2. **2-hop特征来源冗余**：同一2-hop节点E可能从多个1-hop邻居（B和D）处获得其特征，取时间戳最新者
+3. **代价函数扩展**：cost可从hop_count扩展为 `alpha*hop + beta*(1/ETX) + gamma*load`
+4. **特征广播与路由更新的关系**：两者独立运行，特征广播频率(1s)远高于路由更新(15s)，确保GNN观测的实时性
+5. **移动性处理（事件驱动链路）**：节点移动→链路断裂→OnLinkBreak立即触发→路由表删除+FeatureStore清除+触发更新广播→全网快速收敛→GNN图自动缩小
+6. **触发更新抑制**：TRIGGER_MIN_INTERVAL=1s内的多次拓扑变化合并为一次广播，防止广播风暴
+7. **事件驱动 vs 周期维护的分工**：事件驱动是主要机制（快速），周期维护是安全网（稳健），两者互补确保无泄漏
